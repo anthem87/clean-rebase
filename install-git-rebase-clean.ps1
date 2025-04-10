@@ -12,17 +12,37 @@ if (!(Test-Path $gitToolsPath)) {
     Write-Host "Creata cartella: $gitToolsPath"
 }
 
-# 2. Contenuto dello script bash (solo ASCII e privo di caratteri non standard)
+# 2. Contenuto dello script bash aggiornato con supporto -h/--help
 $bashScript = @'
 #!/usr/bin/env bash
 # Script: git-rebase-clean
 # Usage:
-#   git rebase-clean           -> Esegue tutta la procedura
-#   git rebase-clean --continue -> Riprende dopo un rebase interrotto
+#   git rebase-clean                         -> usa origin/develop e messaggio di default
+#   git rebase-clean -r my-branch            -> rebase da un branch specifico
+#   git rebase-clean -sm "nuovo messaggio"   -> messaggio di commit personalizzato
+#   git rebase-clean -r branch -sm "msg"     -> personalizza entrambi
+#   git rebase-clean --continue              -> riprende dopo conflitti
+#   git rebase-clean -h / --help             -> mostra questo help
 
 set -e
 
 STATE_FILE="$HOME/.git-tools/.rebase-clean-state"
+baseBranch="origin/develop"
+squashMsg="feat: complete work (squash)"
+
+function print_help {
+  echo ""
+  echo "USO:"
+  echo "  git rebase-clean                  Esegue squash e rebase da origin/develop"
+  echo "  git rebase-clean -r branch        Specifica il branch da cui fare rebase"
+  echo "  git rebase-clean -sm \"msg\"       Specifica il messaggio del commit squash"
+  echo "  git rebase-clean -r branch -sm \"msg\""
+  echo "                                    Personalizza branch e messaggio"
+  echo "  git rebase-clean --continue       Riprende dopo conflitti"
+  echo "  git rebase-clean -h / --help      Mostra questo help"
+  echo ""
+  exit 0
+}
 
 function continue_after_rebase {
   if [ ! -f "$STATE_FILE" ]; then
@@ -49,10 +69,29 @@ function continue_after_rebase {
   exit 0
 }
 
-# If --continue is passed, resume
-if [[ "$1" == "--continue" ]]; then
-  continue_after_rebase
-fi
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --continue)
+      continue_after_rebase
+      ;;
+    -r)
+      baseBranch="$2"
+      shift 2
+      ;;
+    -sm)
+      squashMsg="$2"
+      shift 2
+      ;;
+    -h|--help)
+      print_help
+      ;;
+    *)
+      echo "Argomento sconosciuto: $1"
+      print_help
+      ;;
+  esac
+done
 
 # Full run
 currentBranch=$(git rev-parse --abbrev-ref HEAD)
@@ -61,18 +100,18 @@ echo "Current branch: $currentBranch"
 git checkout -b temp-rebase-clean
 echo "Created temporary branch: temp-rebase-clean"
 
-base=$(git merge-base origin/develop HEAD)
-echo "Base with develop: $base"
+base=$(git merge-base "$baseBranch" HEAD)
+echo "Base with $baseBranch: $base"
 
 git reset --soft "$base"
-git commit -m "feat: complete work (squash)"
-echo "Single commit created."
+git commit -m "$squashMsg"
+echo "Single commit created with message: \"$squashMsg\""
 
 git fetch origin
 echo "Fetch from origin done."
 
-echo "Starting rebase on origin/develop..."
-if ! git rebase origin/develop; then
+echo "Starting rebase on $baseBranch..."
+if ! git rebase "$baseBranch"; then
   echo ""
   echo "Conflict during rebase!"
   echo "Resolve conflicts, then:"
@@ -116,7 +155,7 @@ if (-not ($currentPath -split ";" | Where-Object { $_ -eq $gitToolsPath })) {
     Write-Host "$gitToolsPath aggiunto al PATH utente."
     Write-Host "Riavvia il terminale per renderlo effettivo."
 } else {
-    Write-Host "$gitToolsPath e' gia' nel PATH utente."
+    Write-Host "$gitToolsPath è già nel PATH utente."
 }
 
 Write-Host ""
