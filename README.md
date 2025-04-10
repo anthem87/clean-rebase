@@ -16,7 +16,6 @@ After installation, you can use:
 
 ```bash
 git rebase-clean
-git rebase-clean --continue
 ```
 
 ## 📦 Installation (Windows)
@@ -29,6 +28,8 @@ $env:Path = "$HOME\.git-tools;$env:Path"
 
 If you encounter conflicts:
 
+```bash
 git add <resolved-files>
 git rebase --continue
 git rebase-clean --continue
+```
