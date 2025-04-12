@@ -1,41 +1,36 @@
+#!/usr/bin/env bash
+
 # Script: git-rebase-clean
 # Usage:
-#   git rebase-clean                         -> uses origin/develop and default commit message
-#   git rebase-clean -r my-branch            -> rebase from a specific branch
-#   git rebase-clean -sm "custom message"    -> use a custom commit message
-#   git rebase-clean -r branch -sm "msg"     -> customize both base branch and message
-#   git rebase-clean --continue              -> resumes after conflicts
-#   git rebase-clean -h / --help             -> shows this help message
+#   git rebase-clean                         → auto-detect base branch and squash/rebase
+#   git rebase-clean -r my-branch            → rebase from a specific branch
+#   git rebase-clean -sm "custom message"    → use a custom commit message
+#   git rebase-clean -r branch -sm "msg"     → customize both base branch and message
+#   git rebase-clean --continue              → resumes after conflict resolution
+#   git rebase-clean -h / --help             → shows help message
 
 set -e
 
-STATE_FILE="$HOME/.git-tools/.rebase-clean-state"
+# Repo-local state file
+STATE_FILE=$(git rev-parse --git-path .rebase-clean-state)
 
-# Default base branch if none specified
-baseBranch="origin/develop"
+# Defaults
+baseBranch=""
 squashMsg="feat: complete work (squash)"
-
-# Check if origin/develop exists (only if -r is not passed)
-if [[ "$*" != *"-r "* ]] && ! git show-ref --verify --quiet refs/remotes/origin/develop; then
-  echo "'origin/develop' not found."
-  echo "Please specify the base branch using:  -r <branch-name>"
-  echo "Example:"
-  echo "  git rebase-clean -r origin/main"
-  exit 1
-fi
-
-squashMsg="feat: complete work (squash)"
+is_continue=false
 
 function print_help {
-  echo ""
-  echo "USAGE:"
-  echo "  git rebase-clean                          Squash and rebase onto origin/develop"
-  echo "  git rebase-clean -r branch                Specify the base branch"
-  echo "  git rebase-clean -sm \\\"msg\\\"            Specify the squash commit message"
-  echo "  git rebase-clean -r branch -sm \\\"msg\\\"  Customize both branch and message"
-  echo "  git rebase-clean --continue               Resume after conflicts"
-  echo "  git rebase-clean -h / --help              Show this help message"
-  echo ""
+  cat <<EOF
+
+USAGE:
+  git rebase-clean                          Squash and rebase onto upstream (or origin/develop fallback)
+  git rebase-clean -r branch                Specify the base branch
+  git rebase-clean -sm "msg"               Specify the squash commit message
+  git rebase-clean -r branch -sm "msg"     Customize both branch and message
+  git rebase-clean --continue              Resume after conflicts
+  git rebase-clean -h / --help             Show this help message
+
+EOF
   exit 0
 }
 
@@ -68,7 +63,8 @@ function continue_after_rebase {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --continue)
-      continue_after_rebase
+      is_continue=true
+      shift
       ;;
     -r)
       baseBranch="$2"
@@ -88,19 +84,58 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Full run
+# Handle resume
+if $is_continue; then
+  continue_after_rebase
+fi
+
+# Auto-detect base branch if not provided
+if [ -z "$baseBranch" ]; then
+  baseBranch=$(git rev-parse --abbrev-ref @{u} 2>/dev/null || true)
+  if [ -z "$baseBranch" ]; then
+    baseBranch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+    baseBranch="origin/${baseBranch:-develop}"
+  fi
+fi
+
+# Validate base branch existence
+if ! git show-ref --verify --quiet "refs/remotes/$baseBranch" && \
+   ! git show-ref --verify --quiet "refs/heads/$baseBranch"; then
+  echo "Error: base branch '$baseBranch' not found."
+  echo "Please specify a valid branch with:  -r <branch-name>"
+  exit 1
+fi
+
+echo "Using base branch: $baseBranch"
+
 currentBranch=$(git rev-parse --abbrev-ref HEAD)
 echo "Current branch: $currentBranch"
 
+# Remove temp branch if it exists
+if git rev-parse --verify --quiet temp-rebase-clean >/dev/null; then
+  git branch -D temp-rebase-clean
+fi
+
+# Create temp branch from current HEAD
 git checkout -b temp-rebase-clean
 echo "Created temporary branch: temp-rebase-clean"
 
+# Find merge base and reset soft to squash
 base=$(git merge-base "$baseBranch" HEAD)
 echo "Base with $baseBranch: $base"
 
 git reset --soft "$base"
+
+# Commit if there’s something staged
+if git diff --cached --quiet; then
+  echo "Nothing to commit. Aborting."
+  git checkout "$currentBranch"
+  git branch -D temp-rebase-clean
+  exit 1
+fi
+
 git commit -m "$squashMsg"
-echo "Single commit created with message: \\\"$squashMsg\\\""
+echo "Single commit created with message: \"$squashMsg\""
 
 git fetch origin
 echo "Fetch from origin done."
@@ -120,7 +155,7 @@ if ! git rebase "$baseBranch"; then
   exit 1
 fi
 
-# No conflicts, continue
+# Finalize
 git checkout "$currentBranch"
 git reset --hard temp-rebase-clean
 echo "Branch $currentBranch updated with clean commit."
