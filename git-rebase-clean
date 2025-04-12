@@ -1,0 +1,135 @@
+# Script: git-rebase-clean
+# Usage:
+#   git rebase-clean                         -> uses origin/develop and default commit message
+#   git rebase-clean -r my-branch            -> rebase from a specific branch
+#   git rebase-clean -sm "custom message"    -> use a custom commit message
+#   git rebase-clean -r branch -sm "msg"     -> customize both base branch and message
+#   git rebase-clean --continue              -> resumes after conflicts
+#   git rebase-clean -h / --help             -> shows this help message
+
+set -e
+
+STATE_FILE="$HOME/.git-tools/.rebase-clean-state"
+
+# Default base branch if none specified
+baseBranch="origin/develop"
+squashMsg="feat: complete work (squash)"
+
+# Check if origin/develop exists (only if -r is not passed)
+if [[ "$*" != *"-r "* ]] && ! git show-ref --verify --quiet refs/remotes/origin/develop; then
+  echo "'origin/develop' not found."
+  echo "Please specify the base branch using:  -r <branch-name>"
+  echo "Example:"
+  echo "  git rebase-clean -r origin/main"
+  exit 1
+fi
+
+squashMsg="feat: complete work (squash)"
+
+function print_help {
+  echo ""
+  echo "USAGE:"
+  echo "  git rebase-clean                          Squash and rebase onto origin/develop"
+  echo "  git rebase-clean -r branch                Specify the base branch"
+  echo "  git rebase-clean -sm \\\"msg\\\"            Specify the squash commit message"
+  echo "  git rebase-clean -r branch -sm \\\"msg\\\"  Customize both branch and message"
+  echo "  git rebase-clean --continue               Resume after conflicts"
+  echo "  git rebase-clean -h / --help              Show this help message"
+  echo ""
+  exit 0
+}
+
+function continue_after_rebase {
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "No rebase-clean state found to continue."
+    exit 1
+  fi
+
+  currentBranch=$(cat "$STATE_FILE")
+  rm -f "$STATE_FILE"
+
+  echo "Continuing rebase-clean on original branch: $currentBranch"
+
+  git checkout "$currentBranch"
+  git reset --hard temp-rebase-clean
+  echo "Branch $currentBranch updated with clean commit."
+
+  git push --force-with-lease origin "$currentBranch"
+  echo "Forced push executed."
+
+  git branch -D temp-rebase-clean
+  echo "Temporary branch removed."
+
+  echo "Operation completed successfully."
+  exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --continue)
+      continue_after_rebase
+      ;;
+    -r)
+      baseBranch="$2"
+      shift 2
+      ;;
+    -sm)
+      squashMsg="$2"
+      shift 2
+      ;;
+    -h|--help)
+      print_help
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      print_help
+      ;;
+  esac
+done
+
+# Full run
+currentBranch=$(git rev-parse --abbrev-ref HEAD)
+echo "Current branch: $currentBranch"
+
+git checkout -b temp-rebase-clean
+echo "Created temporary branch: temp-rebase-clean"
+
+base=$(git merge-base "$baseBranch" HEAD)
+echo "Base with $baseBranch: $base"
+
+git reset --soft "$base"
+git commit -m "$squashMsg"
+echo "Single commit created with message: \\\"$squashMsg\\\""
+
+git fetch origin
+echo "Fetch from origin done."
+
+echo "Starting rebase on $baseBranch..."
+if ! git rebase "$baseBranch"; then
+  echo ""
+  echo "Conflict during rebase!"
+  echo "Resolve conflicts, then:"
+  echo "  git add <files>"
+  echo "  git rebase --continue"
+  echo "  git rebase-clean --continue"
+  echo ""
+  echo "Saving state to continue after resolution."
+
+  echo "$currentBranch" > "$STATE_FILE"
+  exit 1
+fi
+
+# No conflicts, continue
+git checkout "$currentBranch"
+git reset --hard temp-rebase-clean
+echo "Branch $currentBranch updated with clean commit."
+
+git push --force-with-lease origin "$currentBranch"
+echo "Forced push executed."
+
+git branch -D temp-rebase-clean
+echo "Temporary branch removed."
+
+rm -f "$STATE_FILE"
+echo "Operation completed successfully."
