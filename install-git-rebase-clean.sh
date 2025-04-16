@@ -1,23 +1,34 @@
 #!/usr/bin/env bash
 
+# install-git-rebase-clean.sh
+# Installs git-rebase-clean (Bash) into ~/.git-tools (compatible with Linux/macOS bash)
+
 set -e
 
-GIT_TOOLS_DIR="$HOME/.git-tools"
-SCRIPT_PATH="$GIT_TOOLS_DIR/git-rebase-clean"
+GIT_TOOLS="$HOME/.git-tools"
+SCRIPT_PATH="$GIT_TOOLS/git-rebase-clean"
 
-echo "=== Installing git-rebase-clean (inline version) ==="
+echo "=== Installing git-rebase-clean ==="
 
-# 1. Create ~/.git-tools if it doesn't exist
-if [ ! -d "$GIT_TOOLS_DIR" ]; then
-    mkdir -p "$GIT_TOOLS_DIR"
-    echo "Created directory: $GIT_TOOLS_DIR"
-else
-    echo "Directory already exists: $GIT_TOOLS_DIR"
-fi
+# 1) Create ~/.git-tools if it doesn't exist
+mkdir -p "$GIT_TOOLS"
 
-# 2. Write bash script inline
-cat > "$SCRIPT_PATH" <<'EOF'
+# 2) Write the git-rebase-clean script inline
+cat << 'EOF' > "$SCRIPT_PATH"
 #!/usr/bin/env bash
+
+# Script: git-rebase-clean
+# Usage (tabular style):
+#
+#   git rebase-clean                          Squash and rebase current branch onto origin/develop
+#   git rebase-clean -r branch                Specify the base branch (e.g. origin/develop)
+#   git rebase-clean -sm "msg"                Set a custom squash commit message
+#   git rebase-clean -r branch -sm "msg"      Customize both base branch and message
+#   git rebase-clean --continue               Resume after conflict resolution
+#   git rebase-clean --abort                  Abort and restore original state
+#   git rebase-clean --dry-run                Simulate actions without modifying anything
+#   git rebase-clean -h / --help              Show this help message
+#
 
 set -e
 
@@ -25,21 +36,66 @@ STATE_FILE=$(git rev-parse --git-path .rebase-clean-state)
 baseBranch=""
 squashMsg="feat: complete work (squash)"
 is_continue=false
+is_abort=false
 dryRun=false
 
 function print_help {
-  cat <<HELP
+  cat <<EOT
 
 USAGE:
   git rebase-clean                          Squash and rebase current branch onto origin/develop
   git rebase-clean -r branch                Specify the base branch (e.g. origin/develop)
-  git rebase-clean -sm "msg"               Set a custom squash commit message
-  git rebase-clean -r branch -sm "msg"     Customize both base branch and message
-  git rebase-clean --continue              Resume after conflict resolution
-  git rebase-clean --dry-run               Simulate actions without modifying anything
-  git rebase-clean -h / --help             Show this help message
+  git rebase-clean -sm "msg"                Set a custom squash commit message
+  git rebase-clean -r branch -sm "msg"      Customize both base branch and message
+  git rebase-clean --continue               Resume after conflict resolution
+  git rebase-clean --abort                  Abort and restore original state
+  git rebase-clean --dry-run                Simulate actions without modifying anything
+  git rebase-clean -h / --help              Show this help message
 
-HELP
+EOT
+  exit 0
+}
+
+function abort_rebase_clean {
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "No rebase-clean state found to abort."
+    exit 1
+  fi
+
+  # Read lines from state file:
+  #   line 1 = original branch name
+  #   line 2 = original HEAD commit
+  mapfile -t lines < "$STATE_FILE"
+  local originalBranch="${lines[0]}"
+  local originalHead="${lines[1]}"
+
+  echo "Aborting git rebase-clean..."
+
+  # If there's a rebase in progress, abort it
+  if [ -d "$(git rev-parse --git-dir)/rebase-merge" ] || [ -d "$(git rev-parse --git-dir)/rebase-apply" ]; then
+    echo "A rebase is in progress. Running 'git rebase --abort'..."
+    git rebase --abort || true
+  fi
+
+  # Switch back to original branch
+  git checkout "$originalBranch" 2>/dev/null || {
+    echo "Error: could not check out original branch '$originalBranch'."
+    exit 1
+  }
+
+  # Reset to the original HEAD commit
+  echo "Restoring '$originalBranch' to commit $originalHead"
+  git reset --hard "$originalHead"
+
+  # Clean up temp branch if it still exists
+  if git rev-parse --verify --quiet temp-rebase-clean >/dev/null; then
+    git branch -D temp-rebase-clean
+  fi
+
+  # Remove state file
+  rm -f "$STATE_FILE"
+
+  echo "All changes reverted. Rebase-clean aborted."
   exit 0
 }
 
@@ -49,10 +105,26 @@ function continue_after_rebase {
     exit 1
   fi
 
-  currentBranch=$(cat "$STATE_FILE")
+  mapfile -t lines < "$STATE_FILE"
+  local currentBranch="${lines[0]}"
+
+  # Safety check before continuing
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "Working directory is dirty. Please commit or stash your changes first."
+    exit 1
+  fi
+
+  # If a rebase is still in progress, continue it
+  if [ -d "$(git rev-parse --git-dir)/rebase-merge" ] || [ -d "$(git rev-parse --git-dir)/rebase-apply" ]; then
+    echo "Git rebase is in progress... attempting to continue"
+    if ! git rebase --continue; then
+      echo "Git rebase could not continue. Please resolve all conflicts manually, stage changes, then retry."
+      exit 1
+    fi
+  fi
 
   if $dryRun; then
-    echo "[dry-run] would restore $currentBranch from temp-rebase-clean"
+    echo "[dry-run] would restore branch: $currentBranch from temp-rebase-clean"
     echo "[dry-run] would push --force-with-lease to origin/$currentBranch"
     echo "[dry-run] would delete temp-rebase-clean"
     echo "[dry-run] would remove $STATE_FILE"
@@ -64,7 +136,7 @@ function continue_after_rebase {
   echo "Continuing rebase-clean on original branch: $currentBranch"
   git checkout "$currentBranch"
   git reset --hard temp-rebase-clean
-  echo "Branch $currentBranch updated with clean commit."
+  echo "Branch '$currentBranch' updated with clean commit."
 
   git push --force-with-lease origin "$currentBranch"
   echo "Forced push executed."
@@ -81,6 +153,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --continue)
       is_continue=true
+      shift
+      ;;
+    --abort)
+      is_abort=true
       shift
       ;;
     --dry-run)
@@ -100,13 +176,30 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown argument: $1"
-      print_help
+      echo "Use 'git rebase-clean -h' to see valid options."
+      exit 1
       ;;
   esac
 done
 
+# If we're resuming or aborting
 if $is_continue; then
   continue_after_rebase
+fi
+if $is_abort; then
+  abort_rebase_clean
+fi
+
+# Check if a rebase is in progress
+if [ -d "$(git rev-parse --git-dir)/rebase-merge" ] || [ -d "$(git rev-parse --git-dir)/rebase-apply" ]; then
+  echo "A rebase is currently in progress. Finish it or run 'git rebase-clean --continue' or 'git rebase-clean --abort'."
+  exit 1
+fi
+
+# Check for dirty working directory
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "Working directory is dirty. Please commit or stash your changes first!"
+  exit 1
 fi
 
 # Auto-detect baseBranch if not set
@@ -123,50 +216,37 @@ if ! git show-ref --verify --quiet "refs/remotes/$baseBranch" && \
   exit 1
 fi
 
-echo "Using base branch: $baseBranch"
-
 currentBranch=$(git rev-parse --abbrev-ref HEAD)
+originalHead=$(git rev-parse HEAD)
+
+echo "Using base branch: $baseBranch"
 echo "Current branch: $currentBranch"
+
+# Write state file: line 1 = current branch, line 2 = original HEAD
+echo "$currentBranch" > "$STATE_FILE"
+echo "$originalHead" >> "$STATE_FILE"
 
 # Cleanup temp branch if exists
 if git rev-parse --verify --quiet temp-rebase-clean >/dev/null; then
-  if $dryRun; then
-    echo "[dry-run] would delete existing temp-rebase-clean branch"
-  else
-    git branch -D temp-rebase-clean
-  fi
+  git branch -D temp-rebase-clean
 fi
 
 # Create temp branch
-if $dryRun; then
-  echo "[dry-run] would create temp branch from $currentBranch"
-else
-  git checkout -b temp-rebase-clean
-fi
+git checkout -b temp-rebase-clean
 
 # Get merge base
 base=$(git merge-base "$baseBranch" HEAD)
 echo "Merge base with $baseBranch: $base"
 
-if $dryRun; then
-  echo "[dry-run] would reset --soft to $base"
-  echo "[dry-run] would commit staged changes as: \"$squashMsg\""
-  echo "[dry-run] would checkout $currentBranch"
-  echo "[dry-run] would reset --hard to temp-rebase-clean"
-  echo "[dry-run] would rebase $currentBranch onto $baseBranch"
-  echo "[dry-run] would push --force-with-lease to origin/$currentBranch"
-  echo "[dry-run] would delete temp-rebase-clean"
-  exit 0
-fi
-
-# Soft reset to squash
+# Soft reset to create a single commit
 git reset --soft "$base"
 
-# Check if anything to commit
+# Check if there's anything to commit
 if git diff --cached --quiet; then
-  echo "Nothing to commit. Aborting."
+  echo "Nothing to commit from merge base to HEAD. Aborting."
   git checkout "$currentBranch"
   git branch -D temp-rebase-clean
+  rm -f "$STATE_FILE"
   exit 1
 fi
 
@@ -179,18 +259,17 @@ echo "Fetched origin."
 # Apply the clean commit to current branch
 git checkout "$currentBranch"
 git reset --hard temp-rebase-clean
-echo "Branch $currentBranch updated with squashed commit."
+echo "Branch '$currentBranch' updated with squashed commit."
 
-echo "Starting rebase of $currentBranch onto $baseBranch..."
+echo "Starting rebase of '$currentBranch' onto '$baseBranch'..."
 if ! git rebase "$baseBranch"; then
   echo ""
   echo "Conflict during rebase!"
-  echo "Resolve manually, then run:"
-  echo "  git add <files>"
-  echo "  git rebase --continue"
+  echo "Resolve conflicts, then stage changed files and run either:"
   echo "  git rebase-clean --continue"
+  echo "or"
+  echo "  git rebase-clean --abort"
   echo ""
-  echo "$currentBranch" > "$STATE_FILE"
   exit 1
 fi
 
@@ -203,25 +282,17 @@ rm -f "$STATE_FILE"
 echo "Operation completed successfully."
 EOF
 
-echo "Script written to: $SCRIPT_PATH"
-
-# 3. Make it executable
+# 3) Make it executable
 chmod +x "$SCRIPT_PATH"
-echo "Marked as executable."
 
-# 4. Add to PATH in ~/.bashrc if not already present
-if ! grep -Fxq 'export PATH="$HOME/.git-tools:$PATH"' "$HOME/.bashrc"; then
-    echo 'export PATH="$HOME/.git-tools:$PATH"' >> "$HOME/.bashrc"
-    echo "$GIT_TOOLS_DIR added to PATH in ~/.bashrc."
-
-    if [[ "$SHELL" == *"bash" ]]; then
-        echo "Sourcing ~/.bashrc to update PATH..."
-        source "$HOME/.bashrc"
-    else
-        echo "Run 'source ~/.bashrc' or restart your terminal to apply changes."
-    fi
+# 4) Add ~/.git-tools to PATH if not already there
+if [[ ":$PATH:" != *":$GIT_TOOLS:"* ]]; then
+  echo "" >> "$HOME/.bashrc"
+  echo "# Added by install-git-rebase-clean.sh" >> "$HOME/.bashrc"
+  echo "export PATH=\"\$PATH:$GIT_TOOLS\"" >> "$HOME/.bashrc"
+  echo "Added $GIT_TOOLS to PATH in ~/.bashrc. Restart or re-source your shell to make it effective."
 else
-    echo "$GIT_TOOLS_DIR is already in PATH in ~/.bashrc."
+  echo "$GIT_TOOLS is already in your PATH."
 fi
 
 echo ""

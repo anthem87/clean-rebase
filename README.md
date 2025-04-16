@@ -10,6 +10,7 @@ A lightweight CLI tool to **squash your current branch into a single commit**, *
 - Rebase a base branch (e.g. `origin/develop`) **onto your current branch**
 - Safely force-push with `--force-with-lease`
 - Resume after rebase conflicts with `--continue`
+- Abort the operation and restore your original branch with `--abort`
 - Dry-run support: simulate everything without modifying your repo
 - Cross-platform: works on Bash, WSL, macOS, and PowerShell on Windows
 
@@ -42,6 +43,7 @@ git rebase-clean -sm "your message"       # squash with custom message
 git rebase-clean -r origin/main -sm "..." # combine both options
 git rebase-clean --dry-run                # simulate all actions without modifying anything
 git rebase-clean --continue               # resume after conflict resolution
+git rebase-clean --abort                  # abort and restore original branch state
 git rebase-clean -h / --help              # show usage
 ```
 
@@ -55,13 +57,18 @@ If a conflict occurs during the rebase:
 
 ```bash
 git add <resolved-files>
-git rebase --continue
 ```
 
 2. Then tell the tool to finish the flow:
 
 ```bash
 git rebase-clean --continue
+```
+
+If you want to cancel and go back to the exact state before the rebase started:
+
+```bash
+git rebase-clean --abort
 ```
 
 ---
