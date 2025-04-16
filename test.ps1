@@ -1,22 +1,18 @@
 # test.ps1
-# Tests git-rebase-clean with conflicts in the current repository
+# Tests git-rebase-clean with -sml and no conflicts
 
 $ErrorActionPreference = "Stop"
 
 $BRANCH_BASE = "develop-test"
-$BRANCH_FEATURE = "feature-conflict"
+$BRANCH_FEATURE = "feature-no-conflict"
 $FILE_NAME = "file.txt"
 $TEST_PASSED = $false
 
 function Safe-Git {
-    param (
-        [string]$Command
-    )
+    param ([string]$Command)
     try {
         iex $Command | Out-Null
-    } catch {
-        # ignore error
-    }
+    } catch {}
 }
 
 # === Cleanup: remove existing local branches ===
@@ -30,53 +26,57 @@ Safe-Git "git push origin --delete $BRANCH_FEATURE"
 # === Checkout main branch ===
 git checkout main
 
-# === Create develop-test with base content ===
+# === Create develop-test with unrelated file ===
 git checkout -b $BRANCH_BASE
-"shared line" | Set-Content $FILE_NAME
-git add $FILE_NAME
+"base content" | Set-Content "base.txt"
+git add "base.txt"
 git commit -m "test: base commit on $BRANCH_BASE"
 
-# === Modify develop-test to create conflict ===
-"change from develop" | Set-Content $FILE_NAME
-git commit -am "test: conflicting change from develop"
+# === Create feature-no-conflict from develop-test ===
+git checkout -b $BRANCH_FEATURE
+"feature commit 1" | Set-Content $FILE_NAME
+git add $FILE_NAME
+git commit -m "test: feature commit 1"
 
-# === Create feature-conflict from previous commit ===
-git checkout -b $BRANCH_FEATURE "HEAD~1"
-"change from feature" | Set-Content $FILE_NAME
-git commit -am "test: conflicting change from feature"
+"feature commit 2" | Set-Content $FILE_NAME
+git commit -am "test: feature commit 2"
 
 # === Simulate a local remote ===
 Safe-Git "git remote remove origin-fake"
 git remote add origin-fake .
 git fetch origin-fake
 
+# === Set fake editor for -sml message ===
+$previousEditor = $env:GIT_EDITOR
+$env:GIT_EDITOR = 'powershell -Command ""echo test: squash success > $args[0]""'
+
 # === Run git-rebase-clean ===
 Write-Host ""
-Write-Host "Running: git rebase-clean on $BRANCH_FEATURE (vs $BRANCH_BASE)"
+Write-Host "Running: git rebase-clean -r $BRANCH_BASE -sml"
 git checkout $BRANCH_FEATURE
 
 try {
-    git rebase-clean -r $BRANCH_BASE -sm "test: squash with conflict"
-    Write-Host ""
-    Write-Host "Test completed successfully. No conflicts detected."
-    $TEST_PASSED = $true
-} catch {
-    Write-Host ""
-    Write-Host "Conflict detected. Resolving automatically:"
-    Write-Host "  git add $FILE_NAME"
-    Write-Host "  git rebase --continue"
-    Write-Host "  git rebase-clean --continue"
+    git rebase-clean -r $BRANCH_BASE -sml
 
-    git add $FILE_NAME
-    $env:GIT_EDITOR = "true"
-    git rebase --continue
-    git rebase-clean --continue
-    $TEST_PASSED = $true
+    $commitMessage = git log -1 --pretty=%B
+    if ($commitMessage -like "*squash success*") {
+        Write-Host "`nFinal commit message contains expected squash text:"
+        Write-Host $commitMessage
+        $TEST_PASSED = $true
+    } else {
+        throw "Unexpected final commit message: '$commitMessage'"
+    }
+} catch {
+    Write-Host "`nTest failed with exception: $_"
+    $TEST_PASSED = $false
 }
+
+# === Restore editor ===
+$env:GIT_EDITOR = $previousEditor
 
 # === Show recent commit log ===
 Write-Host ""
-Write-Host "Partial log for branch $BRANCH_FEATURE:"
+Write-Host "Partial log for branch ${BRANCH_FEATURE}:"
 git log --oneline --graph --decorate -n 5
 
 # === Cleanup: remove local branches ===
