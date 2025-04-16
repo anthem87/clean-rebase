@@ -7,6 +7,7 @@ A lightweight CLI tool to **squash your current branch into a single commit**, *
 ## 🚀 Features
 
 - Squash all local commits into one (with optional custom message)
+- Optionally edit the squash message using a list of existing commits (`-sml`)
 - Rebase a base branch (e.g. `origin/develop`) **onto your current branch**
 - Safely force-push with `--force-with-lease`
 - Resume after rebase conflicts with `--continue`
@@ -40,6 +41,7 @@ $env:Path = "$HOME\.git-tools;$env:Path"
 git rebase-clean                          # squash & rebase origin/develop onto current branch
 git rebase-clean -r origin/main           # use a custom base branch
 git rebase-clean -sm "your message"       # squash with custom message
+git rebase-clean -sml                     # edit squash message from existing commit list
 git rebase-clean -r origin/main -sm "..." # combine both options
 git rebase-clean --dry-run                # simulate all actions without modifying anything
 git rebase-clean --continue               # resume after conflict resolution

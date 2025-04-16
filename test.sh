@@ -1,89 +1,97 @@
 #!/usr/bin/env bash
 
 # test.sh
-# Tests git-rebase-clean with conflicts in the current repository
+# Tests git-rebase-clean with -sml and no conflicts (Linux/macOS/WSL compatible)
 
-set -e
+set -euo pipefail
 
 BRANCH_BASE="develop-test"
-BRANCH_FEATURE="feature-conflict"
+BRANCH_FEATURE="feature-no-conflict"
 FILE_NAME="file.txt"
+TEST_PASSED=false
+
+# Simulate safe git command
+safe_git() {
+  git "$@" 2>/dev/null || true
+}
 
 # === Cleanup: remove existing local branches ===
-git branch -D "$BRANCH_BASE" 2>/dev/null || true
-git branch -D "$BRANCH_FEATURE" 2>/dev/null || true
+safe_git branch -D "$BRANCH_BASE"
+safe_git branch -D "$BRANCH_FEATURE"
 
 # === Cleanup: remove existing remote branches ===
-git push origin --delete "$BRANCH_BASE" 2>/dev/null || true
-git push origin --delete "$BRANCH_FEATURE" 2>/dev/null || true
+safe_git push origin --delete "$BRANCH_BASE"
+safe_git push origin --delete "$BRANCH_FEATURE"
 
 # === Checkout main branch ===
 git checkout main
 
-# === Create develop-test with base content ===
+# === Create develop-test with unrelated file ===
 git checkout -b "$BRANCH_BASE"
-echo "shared line" > "$FILE_NAME"
-git add "$FILE_NAME"
+echo "base content" > base.txt
+git add base.txt
 git commit -m "test: base commit on $BRANCH_BASE"
 
-# === Modify develop-test to create conflict ===
-echo "change from develop" > "$FILE_NAME"
-git commit -am "test: conflicting change from develop"
+# === Create feature-no-conflict from develop-test ===
+git checkout -b "$BRANCH_FEATURE"
+echo "feature commit 1" > "$FILE_NAME"
+git add "$FILE_NAME"
+git commit -m "test: feature commit 1"
 
-# === Create feature-conflict from previous commit ===
-git checkout -b "$BRANCH_FEATURE" HEAD~1
-echo "change from feature" > "$FILE_NAME"
-git commit -am "test: conflicting change from feature"
+echo "feature commit 2" > "$FILE_NAME"
+git commit -am "test: feature commit 2"
 
 # === Simulate a local remote ===
-git remote remove origin-fake 2>/dev/null || true
+safe_git remote remove origin-fake
 git remote add origin-fake .
 git fetch origin-fake
 
+# === Set fake editor for -sml ===
+export GIT_EDITOR='sh -c "echo test: squash success > $1" --'
+
 # === Run git-rebase-clean ===
 echo ""
-echo "Running: git rebase-clean on $BRANCH_FEATURE (vs $BRANCH_BASE)"
+echo "Running: git rebase-clean -r $BRANCH_BASE -sml"
 git checkout "$BRANCH_FEATURE"
 
-if git rebase-clean -r "$BRANCH_BASE" -sm "test: squash with conflict"; then
-    echo ""
-    echo "Test completed successfully. No conflicts detected."
-    TEST_PASSED=true
-else
-    echo ""
-    echo "Conflict detected. Resolving automatically:"
-    echo "  git add $FILE_NAME"
-    echo "  git rebase --continue"
-    echo "  git rebase-clean --continue"
+if git rebase-clean -r "$BRANCH_BASE" -sml; then
+  COMMIT_MESSAGE=$(git log -1 --pretty=%B)
 
-    git add "$FILE_NAME"
-    GIT_EDITOR=true git rebase --continue
-    git rebase-clean --continue
+  if [[ "$COMMIT_MESSAGE" == *squash success* ]]; then
+    echo -e "\n✅ Final commit message contains expected squash text:"
+    echo "$COMMIT_MESSAGE"
     TEST_PASSED=true
+  else
+    echo -e "\n❌ Unexpected final commit message:"
+    echo "$COMMIT_MESSAGE"
+    TEST_PASSED=false
+  fi
+else
+  echo -e "\n❌ git rebase-clean failed unexpectedly."
+  TEST_PASSED=false
 fi
 
 # === Show recent commit log ===
-echo ""
-echo "Partial log for branch $BRANCH_FEATURE:"
+echo -e "\nPartial log for branch $BRANCH_FEATURE:"
 git log --oneline --graph --decorate -n 5
 
 # === Cleanup: remove local branches ===
 git checkout main
-git branch -D "$BRANCH_BASE" 2>/dev/null || true
-git branch -D "$BRANCH_FEATURE" 2>/dev/null || true
+safe_git branch -D "$BRANCH_BASE"
+safe_git branch -D "$BRANCH_FEATURE"
 
 # === Cleanup: remove remote branches ===
-git push origin --delete "$BRANCH_BASE" 2>/dev/null || true
-git push origin --delete "$BRANCH_FEATURE" 2>/dev/null || true
+safe_git push origin --delete "$BRANCH_BASE"
+safe_git push origin --delete "$BRANCH_FEATURE"
 
 # === Cleanup: remove fake remote references ===
-git remote remove origin-fake 2>/dev/null || true
-rm -rf .git/refs/remotes/origin-fake
+safe_git remote remove origin-fake
+rm -rf ".git/refs/remotes/origin-fake"
 
 # === Final result ===
 echo ""
 if [ "$TEST_PASSED" = true ]; then
-    echo "TEST PASSED: git rebase-clean executed and completed successfully."
+  echo "TEST PASSED: git rebase-clean executed and completed successfully."
 else
-    echo "TEST FAILED: git rebase-clean did not complete as expected."
+  echo "TEST FAILED: git rebase-clean did not complete as expected."
 fi
