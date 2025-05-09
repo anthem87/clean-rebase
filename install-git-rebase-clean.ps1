@@ -6,13 +6,11 @@ $scriptPath   = Join-Path $gitToolsPath "git-rebase-clean"
 
 Write-Host "=== Installing git-rebase-clean ==="
 
-# 1. Create ~/.git-tools if it doesn't exist
 if (!(Test-Path $gitToolsPath)) {
     New-Item -ItemType Directory -Path $gitToolsPath | Out-Null
     Write-Host "Created folder: $gitToolsPath"
 }
 
-# 2. Define bash script content inline
 $bashScript = @'
 #!/usr/bin/env bash
 
@@ -44,7 +42,6 @@ EOF
   exit 0
 }
 
-# Argument parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --continue)
@@ -83,14 +80,39 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $is_continue; then
-  # continuation logic (omitted here to keep it short)
-  echo "[...] handling --continue"
+  echo "[git-rebase-clean] Continuing rebase..."
+  git rebase --continue || {
+    echo "Rebase continue failed. Fix conflicts and run again."
+    exit 1
+  }
+
+  currentBranch=$(cat "$STATE_FILE" | head -n1)
+  git push --force-with-lease origin "$currentBranch"
+
+  git branch -D temp-rebase-clean 2>/dev/null
+  rm -f "$STATE_FILE"
+
+  echo "Rebase completed and branch pushed."
   exit 0
 fi
 
 if $is_abort; then
-  # abort logic (omitted here to keep it short)
-  echo "[...] handling --abort"
+  echo "[git-rebase-clean] Aborting rebase..."
+  git rebase --abort || {
+    echo "Failed to abort rebase. You might need to resolve it manually."
+    exit 1
+  }
+
+  currentBranch=$(cat "$STATE_FILE" | head -n1)
+  originalHead=$(cat "$STATE_FILE" | tail -n1)
+
+  git checkout "$currentBranch"
+  git reset --hard "$originalHead"
+
+  git branch -D temp-rebase-clean 2>/dev/null
+  rm -f "$STATE_FILE"
+
+  echo "Rebase aborted and branch restored."
   exit 0
 fi
 
@@ -131,7 +153,6 @@ git checkout -b temp-rebase-clean
 base=$(git merge-base "$baseBranch" HEAD)
 echo "Merge base with $baseBranch: $base"
 
-# Handle -sml interactive editing of squash message
 if $use_sml; then
   tempMsgFile=$(mktemp)
   git log "$base"..HEAD --pretty=format:"- %s" > "$tempMsgFile"
@@ -195,13 +216,11 @@ rm -f "$STATE_FILE"
 echo "Operation completed successfully."
 '@
 
-# Write to file as UTF-8 without BOM
 $utf8NoBOM = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($scriptPath, $bashScript, $utf8NoBOM)
 
 Write-Host "Script saved to: $scriptPath"
 
-# 3. Add ~/.git-tools to PATH if not already there
 $currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 if (-not ($currentPath -split ";" | Where-Object { $_ -eq $gitToolsPath })) {
     [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$gitToolsPath", "User")
