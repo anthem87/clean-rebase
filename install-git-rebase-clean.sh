@@ -10,10 +10,8 @@ SCRIPT_PATH="$GIT_TOOLS_DIR/git-rebase-clean"
 
 echo "=== Installing git-rebase-clean ==="
 
-# Create ~/.git-tools if it doesn't exist
 mkdir -p "$GIT_TOOLS_DIR"
 
-# Bash script content
 cat > "$SCRIPT_PATH" <<'EOF'
 #!/usr/bin/env bash
 
@@ -45,7 +43,6 @@ USAGE
   exit 0
 }
 
-# Argument parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --continue) is_continue=true; shift ;;
@@ -60,12 +57,39 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $is_continue; then
-  echo "[...] handling --continue"
+  echo "[git-rebase-clean] Continuing rebase..."
+  git rebase --continue || {
+    echo "Rebase continue failed. Fix conflicts and run again."
+    exit 1
+  }
+
+  currentBranch=$(cat "$STATE_FILE" | head -n1)
+  git push --force-with-lease origin "$currentBranch"
+
+  git branch -D temp-rebase-clean 2>/dev/null
+  rm -f "$STATE_FILE"
+
+  echo "Rebase completed and branch pushed."
   exit 0
 fi
 
 if $is_abort; then
-  echo "[...] handling --abort"
+  echo "[git-rebase-clean] Aborting rebase..."
+  git rebase --abort || {
+    echo "Failed to abort rebase. You might need to resolve it manually."
+    exit 1
+  }
+
+  currentBranch=$(cat "$STATE_FILE" | head -n1)
+  originalHead=$(cat "$STATE_FILE" | tail -n1)
+
+  git checkout "$currentBranch"
+  git reset --hard "$originalHead"
+
+  git branch -D temp-rebase-clean 2>/dev/null
+  rm -f "$STATE_FILE"
+
+  echo "Rebase aborted and branch restored."
   exit 0
 fi
 
@@ -84,7 +108,7 @@ if [ -z "$baseBranch" ]; then
   baseBranch="origin/develop"
 fi
 
-if ! git show-ref --verify --quiet "refs/remotes/$baseBranch" &&    ! git show-ref --verify --quiet "refs/heads/$baseBranch"; then
+if ! git show-ref --verify --quiet "refs/remotes/$baseBranch" && ! git show-ref --verify --quiet "refs/heads/$baseBranch"; then
   echo "Error: base branch '$baseBranch' not found."
   echo "Please specify a valid branch with: -r <branch-name>"
   exit 1
@@ -117,8 +141,8 @@ if $use_sml; then
     exit 1
   fi
 
-  echo "Opening editor (\${EDITOR:-vi}) to edit squash commit message..."
-  \${EDITOR:-vi} "$tempMsgFile" || {
+  echo "Opening editor (${EDITOR:-vi}) to edit squash commit message..."
+  ${EDITOR:-vi} "$tempMsgFile" || {
     echo "Could not open editor. Falling back to default commit message."
     squashMsg="feat: complete work (squash)"
     rm -f "$tempMsgFile"
@@ -144,7 +168,7 @@ if git diff --cached --quiet; then
 fi
 
 git commit -m "$squashMsg"
-echo "Single commit created: "$squashMsg""
+echo "Single commit created: \"$squashMsg\""
 
 git fetch origin
 git checkout "$currentBranch"
@@ -170,9 +194,8 @@ EOF
 
 chmod +x "$SCRIPT_PATH"
 
-# Add ~/.git-tools to PATH if not already there
 if [[ ":$PATH:" != *":$GIT_TOOLS_DIR:"* ]]; then
-  echo "export PATH="\$HOME/.git-tools:\$PATH"" >> "$HOME/.bashrc"
+  echo 'export PATH="$HOME/.git-tools:$PATH"' >> "$HOME/.bashrc"
   echo "$GIT_TOOLS_DIR added to PATH. Restart your shell to activate it."
 else
   echo "$GIT_TOOLS_DIR is already in PATH."
