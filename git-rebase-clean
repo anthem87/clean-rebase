@@ -1,194 +1,1370 @@
 #!/usr/bin/env bash
 
-# Script: git-rebase-clean
-# Usage:
-#   git rebase-clean                         → squash current branch and rebase it onto origin/develop
-#   git rebase-clean -r my-branch            → rebase onto a specific base branch
-#   git rebase-clean -sm "custom message"    → use a custom commit message
-#   git rebase-clean -r branch -sm "msg"     → customize both base branch and message
-#   git rebase-clean --continue              → resumes after conflict resolution
-#   git rebase-clean --dry-run               → simulate all actions without changing anything
-#   git rebase-clean -h / --help             → shows help message
+set -euo pipefail
+IFS=$'\n\t'
 
-set -e
+# Version and metadata
+readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_NAME="git-rebase-clean"
 
-STATE_FILE=$(git rev-parse --git-path .rebase-clean-state)
+# Environment normalization
+export LC_ALL=C
+export LANG=C
+export TZ=UTC
+
+# Canonical paths (check if we're in a git repo first)
+if git rev-parse --git-dir &>/dev/null 2>&1; then
+  readonly GIT_DIR=$(git rev-parse --git-dir)
+else
+  readonly GIT_DIR=".git"
+fi
+readonly STATE_DIR="$GIT_DIR/rebase-clean-state"
+readonly STATE_FILE="$STATE_DIR/state"
+readonly HISTORY_FILE="$STATE_DIR/history"
+readonly TRANSFORMS_DIR="$STATE_DIR/transforms"
+readonly CACHE_DIR="$STATE_DIR/cache"
+readonly QUERIES_DIR="$STATE_DIR/queries"
+readonly CHECKPOINTS_FILE="$STATE_DIR/checkpoints"
+readonly LOCK_FILE="$STATE_DIR/lock"
+readonly LOG_FILE="$STATE_DIR/operation.log"
+
+# Configuration variables
 baseBranch=""
-squashMsg="feat: complete work (squash)"
+squashMsg=""
+squashMsgFromList=false
 is_continue=false
-dryRun=false
+is_abort=false
+is_force_abort=false
+is_status=false
+is_gc=false
+shouldPush=false
+pushInteractive=true
+skipSemanticAnalysis=false
+verbose=false
+maxRetries=3
+retryDelay=1
+
+# Total checkpoints count
+readonly TOTAL_CHECKPOINTS=10
+
+# OS detection
+readonly OS_TYPE=$(uname -s)
+
+# Lock management variables
+LOCK_FD=""
+HAS_FLOCK=false
+
+# Check for flock availability
+if command -v flock &>/dev/null; then
+  HAS_FLOCK=true
+fi
+
+# ==============================================================================
+# CHECKPOINT DEFINITIONS (without associative array)
+# ==============================================================================
+
+function get_checkpoint_description {
+  local checkpoint="$1"
+  case "$checkpoint" in
+    "01:init") echo "Environment initialized" ;;
+    "02:state_saved") echo "Original state saved" ;;
+    "03:history_saved") echo "Commit history analyzed" ;;
+    "04:temp_created") echo "Temporary branch created" ;;
+    "05:commits_squashed") echo "Commits squashed" ;;
+    "06:rebase_started") echo "Rebase initiated" ;;
+    "07:rebase_completed") echo "Rebase completed" ;;
+    "08:transforms_extracted") echo "Transformations extracted" ;;
+    "09:history_restored") echo "History restored" ;;
+    "10:cleanup_done") echo "Cleanup completed" ;;
+    *) echo "Unknown checkpoint" ;;
+  esac
+}
+
+# ==============================================================================
+# LANGUAGE MAPPINGS (without associative array)
+# ==============================================================================
+
+function get_language_for_extension {
+  local ext="$1"
+  case "$ext" in
+    py) echo "python" ;;
+    js|jsx) echo "javascript" ;;
+    ts) echo "typescript" ;;
+    tsx) echo "tsx" ;;
+    java) echo "java" ;;
+    go) echo "go" ;;
+    rs) echo "rust" ;;
+    c|h) echo "c" ;;
+    cpp|cc|hpp) echo "cpp" ;;
+    kt) echo "kotlin" ;;
+    scala) echo "scala" ;;
+    swift) echo "swift" ;;
+    rb) echo "ruby" ;;
+    php) echo "php" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ==============================================================================
+# UTILITY FUNCTIONS
+# ==============================================================================
+
+function timestamp {
+  date '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S'
+}
+
+function log {
+  local level="$1"
+  shift
+  local message="[$(timestamp)] [$level] $*"
+  
+  # Always log to file if it exists
+  if [ -n "${LOG_FILE:-}" ] && [ -d "$(dirname "$LOG_FILE")" ]; then
+    echo "$message" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+  
+  # Conditional console output
+  case "$level" in
+    ERROR|WARN)
+      echo "$message" >&2
+      ;;
+    INFO)
+      if [ "$verbose" = true ]; then
+        echo "$message" >&2
+      fi
+      ;;
+    DEBUG)
+      if [ "$verbose" = true ]; then
+        echo "$message" >&2
+      fi
+      ;;
+    PROGRESS)
+      echo "$message" >&2
+      ;;
+  esac
+}
+
+function log_error { log "ERROR" "$@"; }
+function log_warn { log "WARN" "$@"; }
+function log_info { log "INFO" "$@"; }
+function log_debug { log "DEBUG" "$@"; }
+function log_progress { log "PROGRESS" "$@"; }
+
+function die {
+  log_error "$@"
+  exit 1
+}
+
+# ==============================================================================
+# DEPENDENCY CHECKING
+# ==============================================================================
+
+function check_dependencies {
+  local missing_required=""
+  
+  # Check for essential commands
+  for cmd in git sed awk grep sort comm; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing_required="$missing_required $cmd"
+    fi
+  done
+  
+  if [ -n "$missing_required" ]; then
+    echo "ERROR: Missing required dependencies:$missing_required" >&2
+    echo "These tools are essential for this script to function." >&2
+    exit 1
+  fi
+  
+  # Check optional dependencies
+  if ! command -v jq &>/dev/null; then
+    log_warn "jq not found - some features may be limited"
+  fi
+  
+  if ! command -v tree-sitter &>/dev/null; then
+    log_warn "tree-sitter not found - semantic analysis will be limited"
+  fi
+}
+
+# ==============================================================================
+# ATOMIC OPERATIONS
+# ==============================================================================
+
+function atomic_write {
+  local file="$1"
+  shift
+  local temp_file
+  temp_file=$(mktemp "${file}.XXXXXX")
+  
+  if [ $# -eq 0 ]; then
+    cat > "$temp_file"
+  else
+    echo "$@" > "$temp_file"
+  fi
+  
+  mv -f "$temp_file" "$file"
+  log_debug "Atomically wrote to $file"
+}
+
+function safe_rm {
+  local target="$1"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    rm -rf "$target"
+    log_debug "Removed $target"
+  fi
+}
+
+function safe_mkdir {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir"
+    log_debug "Created directory $dir"
+  fi
+}
+
+function sed_inplace {
+  local file="$1"
+  shift
+  
+  # Create backup and then remove it for compatibility
+  if [ "$OS_TYPE" = "Darwin" ]; then
+    sed -i '' "$@" "$file"
+  else
+    sed -i.bak "$@" "$file"
+    rm -f "${file}.bak"
+  fi
+}
+
+# ==============================================================================
+# LOCK MANAGEMENT
+# ==============================================================================
+
+function acquire_lock {
+  local timeout="${1:-30}"
+  local lock_acquired=false
+  
+  safe_mkdir "$STATE_DIR"
+  
+  if [ "$HAS_FLOCK" = true ]; then
+    # Use flock for atomic locking
+    exec 200>"$LOCK_FILE"
+    LOCK_FD=200
+    
+    if flock -n 200; then
+      echo $$ > "$LOCK_FILE"
+      lock_acquired=true
+      log_debug "Lock acquired with flock (PID $$)"
+    else
+      log_info "Waiting for lock (timeout: ${timeout}s)..."
+      if flock -w "$timeout" 200; then
+        echo $$ > "$LOCK_FILE"
+        lock_acquired=true
+        log_debug "Lock acquired with flock after wait (PID $$)"
+      fi
+    fi
+  else
+    # Fallback to manual lock management
+    local elapsed=0
+    while [ -f "$LOCK_FILE" ] && [ $elapsed -lt $timeout ]; do
+      local lock_pid
+      lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+      
+      # Check if lock holder is still alive
+      if [ "$lock_pid" != "unknown" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        log_warn "Removing stale lock from PID $lock_pid"
+        rm -f "$LOCK_FILE"
+        break
+      fi
+      
+      log_info "Waiting for lock held by PID $lock_pid..."
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    
+    if [ ! -f "$LOCK_FILE" ]; then
+      echo $$ > "$LOCK_FILE"
+      lock_acquired=true
+      log_debug "Lock acquired manually (PID $$)"
+    fi
+  fi
+  
+  if [ "$lock_acquired" = false ]; then
+    die "Could not acquire lock after ${timeout}s"
+  fi
+}
+
+function release_lock {
+  if [ "$HAS_FLOCK" = true ] && [ -n "$LOCK_FD" ]; then
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    LOCK_FD=""
+  fi
+  
+  if [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$LOCK_FILE"
+    log_debug "Lock released by PID $$"
+  fi
+}
+
+# ==============================================================================
+# CANONICAL OPERATIONS
+# ==============================================================================
+
+function canonical_sort {
+  LC_ALL=C sort -u
+}
+
+function canonical_hash {
+  local input="${1:-}"
+  
+  if [ -z "$input" ]; then
+    cat
+  else
+    echo -n "$input"
+  fi | {
+    if command -v sha256sum &>/dev/null; then
+      sha256sum | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+      shasum -a 256 | cut -d' ' -f1
+    elif command -v md5 &>/dev/null; then
+      md5
+    else
+      md5sum | cut -d' ' -f1
+    fi
+  }
+}
+
+# ==============================================================================
+# CHECKPOINT MANAGEMENT
+# ==============================================================================
+
+function checkpoint_exists {
+  local checkpoint="$1"
+  [ -f "$CHECKPOINTS_FILE" ] && grep -q "^${checkpoint}:" "$CHECKPOINTS_FILE"
+}
+
+function set_checkpoint {
+  local checkpoint="$1"
+  
+  if checkpoint_exists "$checkpoint"; then
+    log_debug "Checkpoint '$checkpoint' already set"
+    return 0
+  fi
+  
+  safe_mkdir "$STATE_DIR"
+  local description
+  description=$(get_checkpoint_description "$checkpoint")
+  echo "${checkpoint}:$(date '+%s'):${description}" >> "$CHECKPOINTS_FILE"
+  
+  # Extract checkpoint number for progress display
+  local num="${checkpoint%%:*}"
+  
+  log_progress "[${num}/${TOTAL_CHECKPOINTS}] ${description} ✓"
+}
+
+function get_current_checkpoint_number {
+  if [ ! -f "$CHECKPOINTS_FILE" ]; then
+    echo 0
+    return
+  fi
+  
+  # Count completed checkpoints
+  wc -l < "$CHECKPOINTS_FILE"
+}
+
+# ==============================================================================
+# STATE MANAGEMENT
+# ==============================================================================
+
+function save_state {
+  local key="$1"
+  local value="$2"
+  
+  safe_mkdir "$STATE_DIR"
+  
+  # Atomic state update
+  local temp_state
+  temp_state=$(mktemp)
+  
+  if [ -f "$STATE_FILE" ]; then
+    grep -v "^${key}=" "$STATE_FILE" > "$temp_state" 2>/dev/null || true
+  fi
+  
+  echo "${key}=${value}" >> "$temp_state"
+  atomic_write "$STATE_FILE" < "$temp_state"
+  rm -f "$temp_state"
+  
+  log_debug "Saved state: $key=${value:0:50}..."
+}
+
+function get_state {
+  local key="$1"
+  local default="${2:-}"
+  
+  if [ -f "$STATE_FILE" ]; then
+    grep "^${key}=" "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- || echo "$default"
+  else
+    echo "$default"
+  fi
+}
+
+# ==============================================================================
+# TREE-SITTER QUERIES
+# ==============================================================================
+
+function setup_query_files {
+  if [ -d "$QUERIES_DIR" ] && [ "$(ls -A "$QUERIES_DIR" 2>/dev/null)" ]; then
+    return 0
+  fi
+  
+  safe_mkdir "$QUERIES_DIR"
+  
+  # Python queries
+  cat > "$QUERIES_DIR/python.scm" << 'EOF'
+(class_definition name: (identifier) @class.name)
+(function_definition name: (identifier) @function.name)
+(decorated_definition definition: (class_definition name: (identifier) @decorated.class))
+(decorated_definition definition: (function_definition name: (identifier) @decorated.function))
+(assignment left: (identifier) @constant.name right: (string))
+EOF
+
+  # JavaScript queries
+  cat > "$QUERIES_DIR/javascript.scm" << 'EOF'
+(class_declaration name: (identifier) @class.name)
+(function_declaration name: (identifier) @function.name)
+(variable_declarator name: (identifier) @var.name)
+(method_definition key: (property_identifier) @method.name)
+(export_statement declaration: (class_declaration name: (identifier) @export.class))
+EOF
+
+  # TypeScript queries
+  cat > "$QUERIES_DIR/typescript.scm" << 'EOF'
+(class_declaration name: (type_identifier) @class.name)
+(interface_declaration name: (type_identifier) @interface.name)
+(function_declaration name: (identifier) @function.name)
+(type_alias_declaration name: (type_identifier) @type.name)
+(enum_declaration name: (identifier) @enum.name)
+(namespace_declaration name: (identifier) @namespace.name)
+EOF
+
+  # Java queries
+  cat > "$QUERIES_DIR/java.scm" << 'EOF'
+(class_declaration name: (identifier) @class.name)
+(interface_declaration name: (identifier) @interface.name)
+(enum_declaration name: (identifier) @enum.name)
+(method_declaration name: (identifier) @method.name)
+(field_declaration declarator: (variable_declarator name: (identifier) @field.name))
+(annotation_type_declaration name: (identifier) @annotation.name)
+EOF
+
+  log_debug "Query files created"
+}
+
+function extract_symbols {
+  local file="$1"
+  local commit="$2"
+  
+  # Check cache first
+  local cache_key
+  cache_key=$(echo "${file}:${commit}" | canonical_hash)
+  local cache_file="$CACHE_DIR/symbols_${cache_key}.json"
+  
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return 0
+  fi
+  
+  local ext="${file##*.}"
+  local lang
+  lang=$(get_language_for_extension "$ext")
+  
+  if [ -z "$lang" ]; then
+    echo '{"file":"'"$file"'","symbols":[]}'
+    return 0
+  fi
+  
+  setup_query_files
+  
+  local query_file="$QUERIES_DIR/${lang}.scm"
+  if [ ! -f "$query_file" ]; then
+    echo '{"file":"'"$file"'","symbols":[]}'
+    return 0
+  fi
+  
+  # Extract content
+  local temp_file
+  temp_file=$(mktemp)
+  if ! git show "${commit}:${file}" > "$temp_file" 2>/dev/null; then
+    echo '{"file":"'"$file"'","symbols":[]}'
+    rm -f "$temp_file"
+    return 0
+  fi
+  
+  # Run tree-sitter query and build JSON
+  local result
+  if command -v tree-sitter &>/dev/null && command -v jq &>/dev/null; then
+    result=$(tree-sitter query "$query_file" "$temp_file" --capture-names 2>/dev/null | \
+      grep -E '@[a-z]+\.[a-z]+' | \
+      sed -E 's/.*@([a-z]+\.[a-z]+): ([^ ]+).*/{"type":"\1","name":"\2"}/' | \
+      jq -s '{file: "'"$file"'", symbols: .}' 2>/dev/null || echo '{"file":"'"$file"'","symbols":[]}')
+  else
+    result='{"file":"'"$file"'","symbols":[]}'
+  fi
+  
+  echo "$result" | tee "$cache_file"
+  rm -f "$temp_file"
+}
+
+function compare_symbols {
+  local before_json="$1"
+  local after_json="$2"
+  
+  if ! command -v jq &>/dev/null; then
+    return 0
+  fi
+  
+  # Extract symbol names using jq
+  local before_names after_names
+  before_names=$(echo "$before_json" | jq -r '.symbols[].name' 2>/dev/null | canonical_sort)
+  after_names=$(echo "$after_json" | jq -r '.symbols[].name' 2>/dev/null | canonical_sort)
+  
+  # Find disappeared and appeared
+  local disappeared appeared
+  disappeared=$(comm -23 <(echo "$before_names") <(echo "$after_names"))
+  appeared=$(comm -13 <(echo "$before_names") <(echo "$after_names"))
+  
+  # Detect likely renames
+  while read -r old; do
+    [ -z "$old" ] && continue
+    
+    local best_match="" best_score=0
+    
+    while read -r new; do
+      [ -z "$new" ] && continue
+      
+      # Calculate similarity
+      local score
+      score=$(calculate_similarity "$old" "$new")
+      
+      if [ "$score" -gt "$best_score" ] && [ "$score" -gt 60 ]; then
+        best_score=$score
+        best_match=$new
+      fi
+    done <<< "$appeared"
+    
+    if [ -n "$best_match" ]; then
+      echo "${old}→${best_match}"
+    fi
+  done <<< "$disappeared"
+}
+
+function calculate_similarity {
+  local s1="$1"
+  local s2="$2"
+  
+  local len1=${#s1}
+  local len2=${#s2}
+  
+  # Quick exact match
+  [ "$s1" = "$s2" ] && echo 100 && return
+  
+  # Case-insensitive match (bash 3 compatible)
+  local s1_lower=$(echo "$s1" | tr '[:upper:]' '[:lower:]')
+  local s2_lower=$(echo "$s2" | tr '[:upper:]' '[:lower:]')
+  [ "$s1_lower" = "$s2_lower" ] && echo 95 && return
+  
+  # Common prefix calculation
+  local min_len=$((len1 < len2 ? len1 : len2))
+  local common_prefix=0
+  
+  for ((i=0; i<min_len; i++)); do
+    [ "${s1:i:1}" = "${s2:i:1}" ] && common_prefix=$((common_prefix + 1)) || break
+  done
+  
+  echo $((common_prefix * 100 / min_len))
+}
+
+# ==============================================================================
+# TRANSFORMATION MANAGEMENT
+# ==============================================================================
+
+function analyze_transformations {
+  local before="$1"
+  local after="$2"
+  
+  log_info "🔍 Analyzing transformations..."
+  
+  safe_mkdir "$TRANSFORMS_DIR"
+  
+  # File renames (separate file)
+  git diff --name-status -M90% "$before..$after" | \
+    grep '^R' | \
+    awk '{print $2 "→" $3}' | \
+    canonical_sort | \
+    atomic_write "$TRANSFORMS_DIR/file_renames"
+  
+  # Deletions (separate file)
+  git diff --name-status "$before..$after" | \
+    grep '^D' | \
+    awk '{print $2}' | \
+    canonical_sort | \
+    atomic_write "$TRANSFORMS_DIR/file_deletions"
+  
+  # Symbol renames (separate file)
+  if [ "$skipSemanticAnalysis" != true ]; then
+    analyze_symbol_renames "$before" "$after"
+  fi
+  
+  # Report counts
+  local file_rename_count=0
+  local deletion_count=0
+  local symbol_rename_count=0
+  
+  [ -f "$TRANSFORMS_DIR/file_renames" ] && file_rename_count=$(wc -l < "$TRANSFORMS_DIR/file_renames")
+  [ -f "$TRANSFORMS_DIR/file_deletions" ] && deletion_count=$(wc -l < "$TRANSFORMS_DIR/file_deletions")
+  [ -f "$TRANSFORMS_DIR/symbol_renames" ] && symbol_rename_count=$(wc -l < "$TRANSFORMS_DIR/symbol_renames")
+  
+  log_info "   File renames: $file_rename_count"
+  log_info "   File deletions: $deletion_count"
+  log_info "   Symbol renames: $symbol_rename_count"
+  
+  local total=$((file_rename_count + deletion_count + symbol_rename_count))
+  log_info "   Total transformations: $total"
+}
+
+function analyze_symbol_renames {
+  local before="$1"
+  local after="$2"
+  
+  local changed_files
+  changed_files=$(git diff --name-only "$before..$after" | \
+    grep -E '\.(py|js|jsx|ts|tsx|java|go|rs|c|cpp|cc|h|hpp)$' | \
+    canonical_sort || true)
+  
+  [ -z "$changed_files" ] && return 0
+  
+  > "$TRANSFORMS_DIR/symbol_renames"
+  
+  while read -r file; do
+    [ -z "$file" ] && continue
+    
+    local before_symbols after_symbols
+    before_symbols=$(extract_symbols "$file" "$before")
+    after_symbols=$(extract_symbols "$file" "$after")
+    
+    # Compare and detect renames
+    compare_symbols "$before_symbols" "$after_symbols" >> "$TRANSFORMS_DIR/symbol_renames"
+  done <<< "$changed_files"
+  
+  canonical_sort < "$TRANSFORMS_DIR/symbol_renames" | \
+    atomic_write "$TRANSFORMS_DIR/symbol_renames.sorted"
+  
+  mv -f "$TRANSFORMS_DIR/symbol_renames.sorted" "$TRANSFORMS_DIR/symbol_renames"
+}
+
+function apply_transformations {
+  local original_diff="$1"
+  local output_diff="$2"
+  
+  # Start with original
+  cp -f "$original_diff" "$output_diff"
+  
+  # Apply deletions first (remove entire diff sections)
+  if [ -f "$TRANSFORMS_DIR/file_deletions" ] && [ -s "$TRANSFORMS_DIR/file_deletions" ]; then
+    while read -r deleted_file; do
+      [ -z "$deleted_file" ] && continue
+      
+      deleted_escaped=$(printf '%s\n' "$deleted_file" | sed 's/[[\.*^$()+?{|]/\\&/g')
+      sed_inplace "$output_diff" "/^diff --git.*$deleted_escaped/,/^diff --git\|^$/d"
+    done < "$TRANSFORMS_DIR/file_deletions"
+  fi
+  
+  # Apply file renames
+  if [ -f "$TRANSFORMS_DIR/file_renames" ] && [ -s "$TRANSFORMS_DIR/file_renames" ]; then
+    while IFS='→' read -r old new; do
+      [ -z "$old" ] || [ -z "$new" ] && continue
+      
+      old_escaped=$(printf '%s\n' "$old" | sed 's/[[\.*^$()+?{|]/\\&/g')
+      new_escaped=$(printf '%s\n' "$new" | sed 's/[&/\]/\\&/g')
+      
+      sed_inplace "$output_diff" "s|$old_escaped|$new_escaped|g"
+    done < "$TRANSFORMS_DIR/file_renames"
+  fi
+  
+  # Apply symbol renames last
+  if [ -f "$TRANSFORMS_DIR/symbol_renames" ] && [ -s "$TRANSFORMS_DIR/symbol_renames" ]; then
+    while IFS='→' read -r old new; do
+      [ -z "$old" ] || [ -z "$new" ] && continue
+      
+      # Use word boundaries for accurate replacement
+      sed_inplace "$output_diff" "s/\b${old}\b/${new}/g"
+    done < "$TRANSFORMS_DIR/symbol_renames"
+  fi
+  
+  log_debug "Applied transformations to diff"
+}
+
+# ==============================================================================
+# CONFLICT DETECTION
+# ==============================================================================
+
+function show_conflict_files {
+  local conflicted_files
+  conflicted_files=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+  
+  if [ -n "$conflicted_files" ]; then
+    echo ""
+    echo "📝 Files with conflicts:"
+    echo "$conflicted_files" | while read -r file; do
+      echo "   • $file"
+    done
+    echo ""
+  fi
+}
+
+# ==============================================================================
+# MAIN OPERATIONS
+# ==============================================================================
+
+function save_original_state {
+  if checkpoint_exists "02:state_saved"; then
+    log_debug "Original state already saved"
+    return 0
+  fi
+  
+  local current_branch current_commit
+  current_branch=$(git rev-parse --abbrev-ref HEAD)
+  current_commit=$(git rev-parse HEAD)
+  
+  save_state "original_branch" "$current_branch"
+  save_state "original_commit" "$current_commit"
+  
+  set_checkpoint "02:state_saved"
+}
+
+function save_commit_history {
+  local branch="$1"
+  local base="$2"
+  
+  if checkpoint_exists "03:history_saved"; then
+    log_debug "Commit history already saved"
+    return 0
+  fi
+  
+  log_info "📝 Analyzing commit structure..."
+  
+  # Assicurati che la directory cache esista
+  safe_mkdir "$CACHE_DIR"
+  
+  # Get commits in deterministic order
+  local commits
+  commits=$(git rev-list --reverse --topo-order "$base..$branch")
+  
+  safe_rm "$HISTORY_FILE"
+  
+  local count=0
+  while read -r commit; do
+    [ -z "$commit" ] && continue
+    
+    local author_name author_email author_date subject
+    author_name=$(git log -1 --format='%an' "$commit")
+    author_email=$(git log -1 --format='%ae' "$commit")
+    author_date=$(git log -1 --format='%at' "$commit")
+    subject=$(git log -1 --format='%s' "$commit")
+    
+    echo "${commit}|${author_name}|${author_email}|${author_date}|${subject}" >> "$HISTORY_FILE"
+    
+    # Save normalized diff
+    git diff --no-renames --full-index "${commit}^..$commit" > "$CACHE_DIR/${commit}.diff"
+    
+    count=$((count + 1))
+  done <<< "$commits"
+  
+  save_state "commit_count" "$count"
+  log_info "   Saved $count commits"
+  
+  set_checkpoint "03:history_saved"
+}
+
+function perform_squash {
+  local base="$1"
+  local message="$2"
+  
+  if checkpoint_exists "05:commits_squashed"; then
+    log_debug "Already squashed"
+    return 0
+  fi
+  
+  # Create temp branch
+  if git show-ref --verify --quiet "refs/heads/temp-rebase-clean"; then
+    git branch -D temp-rebase-clean
+  fi
+  
+  git checkout -b temp-rebase-clean
+  set_checkpoint "04:temp_created"
+  
+  # Squash commits
+  git reset --soft "$base"
+  
+  if git diff --cached --quiet; then
+    log_error "Nothing to commit"
+    return 1
+  fi
+  
+  git commit -m "$message"
+  
+  save_state "squash_commit" "$(git rev-parse HEAD)"
+  set_checkpoint "05:commits_squashed"
+}
+
+function perform_rebase {
+  local branch="$1"
+  local target="$2"
+  
+  if checkpoint_exists "07:rebase_completed"; then
+    log_debug "Rebase already complete"
+    return 0
+  fi
+  
+  # Apply squash to original branch
+  git checkout "$branch"
+  git reset --hard temp-rebase-clean
+  
+  set_checkpoint "06:rebase_started"
+  
+  # Perform rebase
+  log_info "🔄 Starting rebase onto $target..."
+  
+  if ! git rebase "$target"; then
+    save_state "rebase_in_progress" "true"
+    
+    log_warn ""
+    log_warn "⚠️  CONFLICT DETECTED"
+    
+    show_conflict_files
+    
+    log_warn "📋 Instructions:"
+    log_warn "  1. Resolve conflicts in the files listed above"
+    log_warn "  2. git add <resolved files>"
+    log_warn "  3. git rebase --continue"
+    log_warn "  4. git rebase-clean --continue"
+    log_warn ""
+    log_warn "To abort: git rebase-clean --abort"
+    
+    return 1
+  fi
+  
+  save_state "rebased_commit" "$(git rev-parse HEAD)"
+  set_checkpoint "07:rebase_completed"
+  
+  return 0
+}
+
+function restore_history {
+  if ! [ -f "$HISTORY_FILE" ]; then
+    log_debug "No history to restore"
+    return 0
+  fi
+  
+  if checkpoint_exists "09:history_restored"; then
+    log_debug "History already restored"
+    return 0
+  fi
+  
+  log_info "🔨 Restoring commit history..."
+  
+  local base_branch
+  base_branch=$(get_state "base_branch" "")
+  
+  git reset --hard "$base_branch"
+  
+  local success=0 failed=0
+  
+  while IFS='|' read -r commit author_name author_email author_date subject; do
+    [ -z "$commit" ] && continue
+    
+    log_debug "Restoring: $subject"
+    
+    local diff_file="$CACHE_DIR/${commit}.diff"
+    local transformed_diff="$CACHE_DIR/${commit}.transformed.diff"
+    
+    # Apply transformations with proper ordering
+    apply_transformations "$diff_file" "$transformed_diff"
+    
+    # Try to apply
+    if git apply --check "$transformed_diff" 2>/dev/null; then
+      git apply --index "$transformed_diff"
+      
+      env GIT_AUTHOR_NAME="$author_name" \
+          GIT_AUTHOR_EMAIL="$author_email" \
+          GIT_AUTHOR_DATE="@${author_date} +0000" \
+          GIT_COMMITTER_DATE="@${author_date} +0000" \
+          git commit -m "$subject" --allow-empty
+      
+      success=$((success + 1))
+    else
+      git commit --allow-empty -m "$subject [merged]"
+      failed=$((failed + 1))
+    fi
+  done < "$HISTORY_FILE"
+  
+  log_info "✅ Restored $success/$((success + failed)) commits"
+  
+  set_checkpoint "09:history_restored"
+}
+
+function cleanup_operation {
+  if checkpoint_exists "10:cleanup_done"; then
+    log_debug "Already cleaned up"
+    return 0
+  fi
+  
+  # Remove temp branches
+  for branch in temp-rebase-clean temp-semantic-squash; do
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+      git branch -D "$branch"
+      log_debug "Deleted branch $branch"
+    fi
+  done
+  
+  set_checkpoint "10:cleanup_done"
+}
+
+# ==============================================================================
+# GARBAGE COLLECTION
+# ==============================================================================
+
+function gc_old_state {
+  local days="${1:-7}"
+  
+  log_info "Running garbage collection (removing states older than $days days)..."
+  
+  if [ ! -d "$STATE_DIR" ]; then
+    log_info "No state directory found"
+    return 0
+  fi
+  
+  local now
+  now=$(date '+%s')
+  local cutoff=$((now - days * 86400))
+  local removed=0
+  
+  # Check each cache file
+  find "$CACHE_DIR" -type f -name "*.json" -o -name "*.diff" 2>/dev/null | while read -r file; do
+    local mtime
+    mtime=$(stat -c '%Y' "$file" 2>/dev/null || stat -f '%m' "$file" 2>/dev/null || echo "$now")
+    
+    if [ "$mtime" -lt "$cutoff" ]; then
+      rm -f "$file"
+      removed=$((removed + 1))
+      log_debug "Removed old cache file: $file"
+    fi
+  done
+  
+  log_info "Garbage collection complete (removed $removed files)"
+}
+
+# ==============================================================================
+# INTERACTIVE PUSH
+# ==============================================================================
+
+function confirm_push {
+  local branch="$1"
+  
+  if [ "$pushInteractive" = false ] || [ "$shouldPush" = false ]; then
+    return $([ "$shouldPush" = true ] && echo 0 || echo 1)
+  fi
+  
+  echo ""
+  echo "Ready to push changes to origin/$branch"
+  echo -n "Proceed? [y/N] "
+  
+  local response
+  read -r response
+  
+  case "$response" in
+    [yY][eE][sS]|[yY])
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ==============================================================================
+# COMMAND HANDLERS
+# ==============================================================================
+
+function show_status {
+  echo "🔍 ${SCRIPT_NAME} status"
+  echo ""
+  
+  if [ ! -d "$STATE_DIR" ]; then
+    echo "No rebase-clean operation in progress"
+    return 0
+  fi
+  
+  echo "Version: $(get_state version unknown)"
+  echo "Started: $(date -d "@$(get_state start_time 0)" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo 'unknown')"
+  echo "Original branch: $(get_state original_branch unknown)"
+  echo "Base branch: $(get_state base_branch unknown)"
+  echo ""
+  
+  local current_checkpoint
+  current_checkpoint=$(get_current_checkpoint_number)
+  echo "Progress: ${current_checkpoint}/${TOTAL_CHECKPOINTS} checkpoints"
+  echo ""
+  
+  if [ -f "$CHECKPOINTS_FILE" ]; then
+    echo "Completed steps:"
+    while IFS=: read -r checkpoint timestamp desc; do
+      echo "  ✓ ${checkpoint} - ${desc}"
+    done < "$CHECKPOINTS_FILE"
+  fi
+  
+  if [ "$(get_state rebase_in_progress false)" = "true" ]; then
+    echo ""
+    echo "⚠️  Rebase in progress - resolve conflicts and run:"
+    echo "   git rebase-clean --continue"
+    
+    show_conflict_files
+  fi
+}
+
+function handle_abort {
+  log_info "🔙 Aborting rebase-clean..."
+  
+  if [ ! -d "$STATE_DIR" ] && [ "$is_force_abort" = false ]; then
+    echo "No operation to abort"
+    return 0
+  fi
+  
+  if [ "$is_force_abort" = true ]; then
+    log_warn "Force abort requested - cleaning everything"
+  fi
+  
+  # Try to restore original state
+  if [ -d "$STATE_DIR" ]; then
+    local original_branch original_commit
+    original_branch=$(get_state "original_branch" "")
+    original_commit=$(get_state "original_commit" "")
+    
+    if [ -n "$original_branch" ] && [ -n "$original_commit" ]; then
+      if git show-ref --verify --quiet "refs/heads/$original_branch"; then
+        git checkout "$original_branch" 2>/dev/null || true
+        git reset --hard "$original_commit" 2>/dev/null || true
+        log_info "Restored $original_branch to $original_commit"
+      fi
+    fi
+  fi
+  
+  # Abort any rebase in progress
+  if [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; then
+    git rebase --abort 2>/dev/null || true
+  fi
+  
+  # Cleanup branches
+  for branch in temp-rebase-clean temp-semantic-squash; do
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+      git branch -D "$branch" 2>/dev/null || true
+    fi
+  done
+  
+  # Clear state
+  safe_rm "$STATE_DIR"
+  
+  log_info "✅ Abort complete"
+}
+
+function handle_continue {
+  if [ ! -d "$STATE_DIR" ]; then
+    die "No rebase-clean operation to continue"
+  fi
+  
+  log_info "📥 Continuing rebase-clean..."
+  
+  # Complete rebase if in progress
+  if [ "$(get_state rebase_in_progress false)" = "true" ]; then
+    if ! git rebase --continue; then
+      die "Failed to continue rebase"
+    fi
+    
+    save_state "rebase_in_progress" "false"
+    save_state "rebased_commit" "$(git rev-parse HEAD)"
+    set_checkpoint "07:rebase_completed"
+  fi
+  
+  # Extract transformations
+  local squash_before rebased_commit
+  squash_before=$(get_state "squash_commit" "")
+  rebased_commit=$(get_state "rebased_commit" "")
+  
+  if [ -n "$squash_before" ] && [ -n "$rebased_commit" ]; then
+    analyze_transformations "$squash_before" "$rebased_commit"
+    set_checkpoint "08:transforms_extracted"
+  fi
+  
+  # Restore history
+  restore_history
+  
+  # Cleanup
+  cleanup_operation
+  
+  # Push if requested
+  local original_branch
+  original_branch=$(get_state "original_branch" "")
+  
+  if [ "$shouldPush" = true ] || confirm_push "$current_branch"; then
+    git push --force-with-lease origin "$current_branch"
+    log_info "📤 Pushed to origin/$current_branch"
+  else
+    log_info "ℹ️  Ready to push: git push --force-with-lease origin $current_branch"
+  fi
+
+  # Non cancellare subito lo stato → mantienilo per i test
+  if [ "${KEEP_STATE:-false}" != "true" ]; then
+    log_info "Cleaning up state directory"
+    safe_rm "$STATE_DIR"
+  else
+    log_info "KEEP_STATE=true, preserving $STATE_DIR"
+  fi
+
+  log_info "🎉 ${SCRIPT_NAME} completed successfully!"
+}
 
 function print_help {
   cat <<EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION} - Enterprise-grade Idempotent Smart Rebase
 
 USAGE:
-  git rebase-clean                          Squash and rebase current branch onto origin/develop
-  git rebase-clean -r branch                Specify the base branch (e.g. origin/develop)
-  git rebase-clean -sm "msg"               Set a custom squash commit message
-  git rebase-clean -r branch -sm "msg"     Customize both base branch and message
-  git rebase-clean --continue              Resume after conflict resolution
-  git rebase-clean --dry-run               Simulate actions without modifying anything
-  git rebase-clean -h / --help             Show this help message
+  git rebase-clean [OPTIONS]
+
+OPTIONS:
+  -r, --base BRANCH           Base branch for rebase (default: origin/develop)
+  -sm, --squash-message MSG   Custom squash commit message
+  --push                      Auto-push after successful rebase
+  --push-interactive          Ask before pushing (default if --push not set)
+  --verbose, -v               Enable verbose output
+
+COMMANDS:
+  --continue                  Resume after conflict resolution
+  --abort                     Abort and restore original state  
+  --force-abort               Force abort even if state is inconsistent
+  --status                    Show current operation status
+  --gc [DAYS]                 Clean up old cache files (default: 7 days)
+  --help, -h                  Show this help message
+
+FEATURES:
+  ✓ Full idempotency with checkpoints
+  ✓ Deterministic operations
+  ✓ Tree-sitter AST analysis
+  ✓ JSON processing with jq
+  ✓ Conflict file visualization
+  ✓ Granular transformation tracking
+
+STATE:
+  State directory: ${STATE_DIR}
+  Lock file: ${LOCK_FILE}
+  Log file: ${LOG_FILE}
+
+EXAMPLES:
+  # Basic rebase
+  git rebase-clean
+
+  # Custom base and message
+  git rebase-clean -r origin/main -sm "Feature complete"
+
+  # Continue after resolving conflicts
+  git rebase-clean --continue
+
+  # Check status of ongoing operation
+  git rebase-clean --status
 
 EOF
-  exit 0
 }
 
-function continue_after_rebase {
-  if [ ! -f "$STATE_FILE" ]; then
-    echo "No rebase-clean state found to continue."
-    exit 1
-  fi
+# ==============================================================================
+# MAIN
+# ==============================================================================
 
-  currentBranch=$(cat "$STATE_FILE")
-
-  if $dryRun; then
-    echo "[dry-run] would restore $currentBranch from temp-rebase-clean"
-    echo "[dry-run] would push --force-with-lease to origin/$currentBranch"
-    echo "[dry-run] would delete temp-rebase-clean"
-    echo "[dry-run] would remove $STATE_FILE"
+function main {
+  # Parse arguments FIRST - before any other operations
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --continue)
+        is_continue=true
+        shift
+        ;;
+      --abort)
+        is_abort=true
+        shift
+        ;;
+      --force-abort)
+        is_force_abort=true
+        shift
+        ;;
+      --status)
+        is_status=true
+        shift
+        ;;
+      --gc)
+        is_gc=true
+        shift
+        ;;
+      --push)
+        shouldPush=true
+        pushInteractive=false
+        shift
+        ;;
+      --push-interactive)
+        shouldPush=true
+        pushInteractive=true
+        shift
+        ;;
+      -r|--base)
+        if [ $# -lt 2 ]; then
+          die "Option $1 requires an argument"
+        fi
+        baseBranch="$2"
+        shift 2
+        ;;
+      -sm|--squash-message)
+        if [ $# -lt 2 ]; then
+          die "Option $1 requires an argument"
+        fi
+        squashMsg="$2"
+        shift 2
+        ;;
+      --verbose|-v)
+        verbose=true
+        shift
+        ;;
+      --help|-h)
+        print_help
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+  
+  # Handle special commands FIRST - before any git operations
+  if [ "$is_status" = true ]; then
+    show_status
     exit 0
   fi
+  
+  if [ "$is_gc" = true ]; then
+    gc_old_state
+    exit 0
+  fi
+  
+  if [ "$is_abort" = true ] || [ "$is_force_abort" = true ]; then
+    # For abort, we might need to acquire lock if state exists
+    if [ -d "$STATE_DIR" ]; then
+      acquire_lock
+    fi
+    handle_abort
+    exit 0
+  fi
+  
+  if [ "$is_continue" = true ]; then
+    acquire_lock
+    handle_continue
+    exit 0
+  fi
+  
+  # Normal operation starts here
+  # Check if we're in a git repository
+  if ! git rev-parse --git-dir &>/dev/null; then
+    die "Not in a git repository"
+  fi
+  
+  acquire_lock
+  
+  # Initialize state
+  save_state "version" "$SCRIPT_VERSION"
+  save_state "start_time" "$(date '+%s')"
+  set_checkpoint "01:init"
+  
+  # Determine base branch
+  [ -z "$baseBranch" ] && baseBranch="origin/develop"
+  
+  if ! git show-ref --verify --quiet "refs/remotes/$baseBranch" && \
+     ! git show-ref --verify --quiet "refs/heads/$baseBranch"; then
+    die "Base branch '$baseBranch' not found"
+  fi
+  
+  save_state "base_branch" "$baseBranch"
+  
+  # Save original state
+  save_original_state
+  
+  local current_branch
+  current_branch=$(get_state "original_branch" "")
+  
+  # Calculate merge base
+  local base_commit
+  base_commit=$(git merge-base "$baseBranch" HEAD)
+  save_state "base_commit" "$base_commit"
+  
+  log_info "🚀 Starting ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+  log_info "   Current branch: $current_branch"
+  log_info "   Base branch: $baseBranch"
+  log_info "   Merge base: $(git rev-parse --short "$base_commit")"
+  
+  # Save commit history
+  save_commit_history "$current_branch" "$base_commit"
+  
+  # Determine squash message
+  if [ -z "$squashMsg" ]; then
+    squashMsg="Squashed $(get_state commit_count 0) commits from $current_branch"
+  fi
+  save_state "squash_message" "$squashMsg"
+  
+  # Perform squash
+  if ! perform_squash "$base_commit" "$squashMsg"; then
+    die "Failed to squash commits"
+  fi
+  
+  # Perform rebase
+  if ! perform_rebase "$current_branch" "$baseBranch"; then
+    exit 1  # Waiting for conflict resolution
+  fi
 
-  rm -f "$STATE_FILE"
+  log_info "DEBUG: Rebase completed, continuing with transformations..."
 
-  echo "Continuing rebase-clean on original branch: $currentBranch"
-  git checkout "$currentBranch"
-  git reset --hard temp-rebase-clean
-  echo "Branch $currentBranch updated with clean commit."
+  local squash_commit rebased_commit
+  squash_commit=$(get_state "squash_commit" "")
+  rebased_commit=$(get_state "rebased_commit" "")
 
-  git push --force-with-lease origin "$currentBranch"
-  echo "Forced push executed."
+  log_info "DEBUG: After rebase - squash_commit=$squash_commit, rebased_commit=$rebased_commit"
 
-  git branch -D temp-rebase-clean
-  echo "Temporary branch removed."
+  # Non bloccare se mancano: esegui comunque
+  analyze_transformations "$squash_commit" "$rebased_commit" || true
+  set_checkpoint "08:transforms_extracted"
 
-  echo "Operation completed successfully."
-  exit 0
+  restore_history
+  cleanup_operation
+  
+  # Push if requested
+  if [ "$shouldPush" = true ] || confirm_push "$current_branch"; then
+    git push --force-with-lease origin "$current_branch"
+    log_info "📤 Pushed to origin/$current_branch"
+  else
+    log_info "ℹ️  Ready to push: git push --force-with-lease origin $current_branch"
+  fi
+  
+  # Clear state only if explicit
+  if [ "${KEEP_STATE:-false}" != "true" ]; then
+    safe_rm "$STATE_DIR"
+  fi
+  
+  log_info "🎉 ${SCRIPT_NAME} completed successfully!"
 }
 
-# Parse args
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --continue)
-      is_continue=true
-      shift
-      ;;
-    --dry-run)
-      dryRun=true
-      shift
-      ;;
-    -r)
-      baseBranch="$2"
-      shift 2
-      ;;
-    -sm)
-      squashMsg="$2"
-      shift 2
-      ;;
-    -h|--help)
-      print_help
-      ;;
-    *)
-      echo "Unknown argument: $1"
-      print_help
-      ;;
-  esac
-done
+# Clean exit handler
+trap release_lock EXIT
 
-if $is_continue; then
-  continue_after_rebase
-fi
-
-# Auto-detect baseBranch if not set
-if [ -z "$baseBranch" ]; then
-  echo "No base branch specified, defaulting to origin/develop"
-  baseBranch="origin/develop"
-fi
-
-# Validate baseBranch
-if ! git show-ref --verify --quiet "refs/remotes/$baseBranch" && \
-   ! git show-ref --verify --quiet "refs/heads/$baseBranch"; then
-  echo "Error: base branch '$baseBranch' not found."
-  echo "Please specify a valid branch with: -r <branch-name>"
-  exit 1
-fi
-
-echo "Using base branch: $baseBranch"
-
-currentBranch=$(git rev-parse --abbrev-ref HEAD)
-echo "Current branch: $currentBranch"
-
-# Cleanup temp branch if exists
-if git rev-parse --verify --quiet temp-rebase-clean >/dev/null; then
-  if $dryRun; then
-    echo "[dry-run] would delete existing temp-rebase-clean branch"
-  else
-    git branch -D temp-rebase-clean
-  fi
-fi
-
-# Create temp branch
-if $dryRun; then
-  echo "[dry-run] would create temp branch from $currentBranch"
-else
-  git checkout -b temp-rebase-clean
-fi
-
-# Get merge base
-base=$(git merge-base "$baseBranch" HEAD)
-echo "Merge base with $baseBranch: $base"
-
-if $dryRun; then
-  echo "[dry-run] would reset --soft to $base"
-  echo "[dry-run] would commit staged changes as: \"$squashMsg\""
-  echo "[dry-run] would checkout $currentBranch"
-  echo "[dry-run] would reset --hard to temp-rebase-clean"
-  echo "[dry-run] would rebase $currentBranch onto $baseBranch"
-  echo "[dry-run] would push --force-with-lease to origin/$currentBranch"
-  echo "[dry-run] would delete temp-rebase-clean"
-  exit 0
-fi
-
-# Soft reset to squash
-git reset --soft "$base"
-
-# Check if anything to commit
-if git diff --cached --quiet; then
-  echo "Nothing to commit. Aborting."
-  git checkout "$currentBranch"
-  git branch -D temp-rebase-clean
-  exit 1
-fi
-
-git commit -m "$squashMsg"
-echo "Single commit created: \"$squashMsg\""
-
-git fetch origin
-echo "Fetched origin."
-
-# Apply the clean commit to current branch
-git checkout "$currentBranch"
-git reset --hard temp-rebase-clean
-echo "Branch $currentBranch updated with squashed commit."
-
-echo "Starting rebase of $currentBranch onto $baseBranch..."
-if ! git rebase "$baseBranch"; then
-  echo ""
-  echo "Conflict during rebase!"
-  echo "Resolve manually, then run:"
-  echo "  git add <files>"
-  echo "  git rebase --continue"
-  echo "  git rebase-clean --continue"
-  echo ""
-  echo "$currentBranch" > "$STATE_FILE"
-  exit 1
-fi
-
-git push --force-with-lease origin "$currentBranch"
-echo "Forced push complete."
-
-git branch -D temp-rebase-clean
-rm -f "$STATE_FILE"
-
-echo "Operation completed successfully."
+# Run main
+main "$@"
